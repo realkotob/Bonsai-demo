@@ -3,14 +3,16 @@
 # Installs all dependencies, downloads models and binaries.
 #
 # Usage:
-#   ./setup.sh                      (downloads 8B model by default)
-#   BONSAI_MODEL=4B ./setup.sh      (download a different model size)
+#   ./setup.sh                          (downloads 27B model by default)
+#   BONSAI_MODEL=4B ./setup.sh          (download a different model size)
+#   BONSAI_TOKEN=hf_xxx ./setup.sh      (read-only HF token; needed for 27B while private)
 set -e
 
 # ── Resolve paths ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 . "$SCRIPT_DIR/scripts/common.sh"
+assert_valid_model
 
 VENV_DIR="$SCRIPT_DIR/.venv"
 VENV_PY="$VENV_DIR/bin/python"
@@ -60,8 +62,8 @@ ask() {
 _smart_apt_install() {
     _pkgs="$*"
 
-    apt-get update -y </dev/null >/dev/null 2>&1 || true
-    apt-get install -y $_pkgs </dev/null >/dev/null 2>&1 || true
+    apt-get update -y </dev/null >/dev/null || true
+    apt-get install -y $_pkgs </dev/null >/dev/null || true
 
     _still_missing=""
     for _p in $_pkgs; do
@@ -107,14 +109,43 @@ _version_ge() {
 }
 
 # ── Model selection ──
-BONSAI_MODEL="${BONSAI_MODEL:-8B}"
+BONSAI_MODEL="${BONSAI_MODEL:-27B}"
+BONSAI_FAMILY="${BONSAI_FAMILY:-ternary}"
 
 echo ""
 echo "========================================="
 echo "   Bonsai Demo Setup"
-echo "   Model: ${BONSAI_MODEL}"
+echo "   Family: ${BONSAI_FAMILY}"
+echo "   Model:  ${BONSAI_MODEL}"
 echo "========================================="
 echo ""
+
+# ── HuggingFace auth ──
+# Use BONSAI_TOKEN (env, or the gitignored .bonsai_token file) only if you need
+# a repo that is still private; public repos download anonymously. Never a hard
+# requirement: the downloader attempts anonymously and HF surfaces a clear 401
+# if a repo genuinely needs auth.
+TOKEN_FILE="$SCRIPT_DIR/.bonsai_token"
+if [ -z "$BONSAI_TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
+    BONSAI_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+fi
+# Offer (never require) a prompt when a tty is attached and no token is set.
+if [ -z "$BONSAI_TOKEN" ] && [ -r /dev/tty ]; then
+    printf "  Optional HuggingFace token for any still-private repo (press Enter to skip): "
+    { read -r BONSAI_TOKEN </dev/tty; } 2>/dev/null || true
+    echo ""
+fi
+if [ -n "$BONSAI_TOKEN" ]; then
+    export BONSAI_TOKEN
+    # Remember it for future runs (gitignored, user-only permissions).
+    if [ ! -f "$TOKEN_FILE" ] || [ "$(tr -d '\r\n' < "$TOKEN_FILE")" != "$BONSAI_TOKEN" ]; then
+        # Write under a restrictive umask so the file is never briefly readable.
+        ( umask 077; printf "%s" "$BONSAI_TOKEN" > "$TOKEN_FILE" )
+    fi
+    # Enforce user-only permissions every run, even for a pre-existing
+    # user-created file with loose modes.
+    chmod 600 "$TOKEN_FILE" 2>/dev/null || true
+fi
 
 
 # ────────────────────────────────────────────────────
@@ -131,7 +162,7 @@ case "$OS" in
         step "Checking Xcode Command Line Tools ..."
         if ! xcode-select -p >/dev/null 2>&1; then
             warn "Xcode CLT not installed. Installing now (a system dialog will appear) ..."
-            xcode-select --install </dev/null 2>/dev/null || true
+            xcode-select --install </dev/null || true
             echo ""
             echo "  After the Xcode CLT installation completes, please re-run:"
             echo "    ./setup.sh"
@@ -230,27 +261,15 @@ info "Base deps installed (cmake, ninja, setuptools, huggingface-cli)."
 # ────────────────────────────────────────────────────
 #  6. Download models from HuggingFace
 # ────────────────────────────────────────────────────
-step "Model download (BONSAI_MODEL=${BONSAI_MODEL}) ..."
-if ls "models/gguf/${BONSAI_MODEL}"/*.gguf >/dev/null 2>&1; then
-    info "Model already present — skipping download."
-    echo "  (Delete models/gguf/${BONSAI_MODEL}/ and re-run to re-download.)"
-else
-    BONSAI_MODEL="$BONSAI_MODEL" sh "$SCRIPT_DIR/scripts/download_models.sh"
-fi
+step "Model download (BONSAI_FAMILY=${BONSAI_FAMILY} BONSAI_MODEL=${BONSAI_MODEL}) ..."
+BONSAI_FAMILY="$BONSAI_FAMILY" BONSAI_MODEL="$BONSAI_MODEL" sh "$SCRIPT_DIR/scripts/download_models.sh"
 
 # ────────────────────────────────────────────────────
 #  7. llama.cpp pre-built binaries
 # ────────────────────────────────────────────────────
-_has_binaries=false
-for _d in bin/mac bin/cuda bin/rocm bin/hip bin/vulkan bin/cpu; do
-    ls "$_d"/llama-* >/dev/null 2>&1 && _has_binaries=true && break
-done
-
-if [ "$_has_binaries" = true ]; then
-    info "llama.cpp binaries already present."
-else
-    sh "$SCRIPT_DIR/scripts/download_binaries.sh"
-fi
+# Always defer to the downloader: it fast-skips when the installed binaries
+# already match the pinned release, and refreshes them when the pin changed.
+sh "$SCRIPT_DIR/scripts/download_binaries.sh"
 
 chmod +x "$SCRIPT_DIR"/scripts/*.sh 2>/dev/null || true
 
@@ -315,15 +334,83 @@ if [ "$OS" = "Darwin" ] && ! bonsai_should_skip_mlx; then
         git clone -b prism https://github.com/PrismML-Eng/mlx.git mlx
     fi
 
-    step "Building MLX from source (this takes 2-5 minutes on first install) ..."
-    # --no-build-isolation required: MLX's C++/Metal build needs pre-installed setuptools
-    uv pip install --python "$VENV_PY" -e mlx/ --no-build-isolation
-    step "Installing MLX Python deps (mlx-lm, torch, transformers, ...) ..."
-    uv pip install --python "$VENV_PY" \
-        "mlx-lm==0.30.7" "torch==2.10.0" "transformers==5.2.0" \
-        "safetensors==0.7.0" "tokenizers==0.22.2" "sentencepiece==0.2.1" \
-        "protobuf==7.34.0" "numpy==2.4.2" "gguf==0.18.0"
-    info "MLX installed."
+    # 27B needs mlx-lm >= 0.31; an older install must be reconciled, not skipped.
+    if "$VENV_PY" -c "
+import mlx, mlx_lm
+v = tuple(int(x) for x in mlx_lm.__version__.split('.')[:2])
+raise SystemExit(0 if v >= (0, 31) else 1)
+" 2>/dev/null; then
+        info "MLX already installed in the venv — skipping build."
+    else
+        step "Building MLX from source (this takes 2-5 minutes on first install) ..."
+        # --no-build-isolation required: MLX's C++/Metal build needs pre-installed setuptools
+        uv pip install --python "$VENV_PY" -e mlx/ --no-build-isolation
+        step "Installing MLX Python deps (mlx-lm, torch, transformers, ...) ..."
+        # mlx-lm >= 0.31 is required for the 27B (qwen3_5) architecture. The
+        # released 27B configs are plain dense (no num_experts field), and stock
+        # mlx-lm builds a SparseMoeBlock only when num_experts > 0 — so it loads
+        # them as dense out of the box, no source patch needed.
+        uv pip install --python "$VENV_PY" \
+            "mlx-lm==0.31.2" "torch==2.10.0" "transformers==5.2.0" \
+            "safetensors==0.7.0" "tokenizers==0.22.2" "sentencepiece==0.2.1" \
+            "protobuf==7.34.0" "numpy==2.4.2" "gguf==0.18.0"
+        info "MLX installed."
+    fi
+
+    # mlx-vlm serves the 27B MLX packs WITH image input (the published packs
+    # ship the FP16 vision tower in mlx-vlm-native layout). It needs stock mlx,
+    # which conflicts with the PrismML fork in .venv (fork = 1-bit kernels), so
+    # it gets its own venv. Ternary (2-bit) runs on stock mlx -> vision works;
+    # binary (1-bit) still needs the fork -> text-only mlx_lm for now.
+    # Skip with BONSAI_MLX_VLM=0.
+    if [ "${BONSAI_MLX_VLM:-1}" != "0" ]; then
+        step "Setting up mlx-vlm venv (MLX image input for the 27B) ..."
+        VLM_VENV="$SCRIPT_DIR/.venv-vlm"
+        if [ -x "$VLM_VENV/bin/python" ] && "$VLM_VENV/bin/python" -c "import mlx_vlm" 2>/dev/null; then
+            info "mlx-vlm venv already present."
+        elif uv venv "$VLM_VENV" --python "$PYTHON_VERSION" >/dev/null 2>&1 \
+            && uv pip install --python "$VLM_VENV/bin/python" "mlx-vlm==0.6.3" "transformers==5.5.0" \
+            && "$VLM_VENV/bin/python" -c "import mlx_vlm" 2>/dev/null; then
+            info "mlx-vlm venv ready (.venv-vlm)."
+        else
+            warn "mlx-vlm venv setup failed — MLX will run text-only (no image input)."
+        fi
+    fi
+fi
+
+# ── Open WebUI: the ChatGPT-like demo UI. Installed into the main venv so
+#    ./scripts/start_openwebui.sh works out of the box. Skip with BONSAI_OPENWEBUI=0. ──
+if [ "${BONSAI_OPENWEBUI:-1}" != "0" ]; then
+    if "$VENV_PY" -c "import open_webui" 2>/dev/null; then
+        info "Open WebUI already installed."
+    else
+        step "Installing Open WebUI (large download, a few minutes) ..."
+        # Install via the pinned `webui` extra in pyproject.toml (open-webui==0.10.2)
+        # rather than an unpinned name, so the version stays reproducible.
+        if uv pip install --python "$VENV_PY" ".[webui]"; then
+            info "Open WebUI installed."
+        else
+            warn "Open WebUI install failed — install it manually with 'uv pip install \".[webui]\"' before running scripts/start_openwebui.sh."
+        fi
+    fi
+fi
+
+# ── Code interpreter (Open WebUI): a Jupyter kernel with the scientific stack
+#    (matplotlib, pandas, numpy, scipy, sympy, yfinance) so the model can run
+#    Python, make plots, and pull market data. Isolated venv, all platforms.
+#    Skip with BONSAI_CODE_INTERPRETER=0. ──
+if [ "${BONSAI_CODE_INTERPRETER:-1}" != "0" ]; then
+    step "Setting up the code-interpreter venv (Jupyter + plotting / data libs) ..."
+    JUP_VENV="$SCRIPT_DIR/.venv-jupyter"
+    if [ -x "$JUP_VENV/bin/jupyter" ]; then
+        info "code-interpreter venv already present."
+    elif uv venv "$JUP_VENV" --python "$PYTHON_VERSION" >/dev/null 2>&1 \
+        && uv pip install --python "$JUP_VENV/bin/python" \
+            jupyter-server ipykernel matplotlib numpy pandas scipy sympy pillow requests yfinance; then
+        info "code-interpreter venv ready (.venv-jupyter)."
+    else
+        warn "code-interpreter venv setup failed — Open WebUI code execution will be unavailable."
+    fi
 fi
 
 # ────────────────────────────────────────────────────
@@ -331,7 +418,7 @@ fi
 # ────────────────────────────────────────────────────
 echo ""
 echo "========================================="
-echo "   Setup complete! (BONSAI_MODEL=${BONSAI_MODEL})"
+echo "   Setup complete! (BONSAI_FAMILY=${BONSAI_FAMILY} BONSAI_MODEL=${BONSAI_MODEL})"
 echo "========================================="
 echo ""
 echo "  See README.md for usage examples."

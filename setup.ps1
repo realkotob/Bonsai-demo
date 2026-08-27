@@ -1,4 +1,4 @@
-# Bonsai Demo — Setup for Windows (PowerShell)
+# Bonsai Demo - Setup for Windows (PowerShell)
 # Usage:  .\setup.ps1
 #   or:   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; .\setup.ps1
 $ErrorActionPreference = "Stop"
@@ -7,12 +7,24 @@ $PythonVersion = "3.11"
 $VenvDir = Join-Path $PSScriptRoot ".venv"
 $VenvPy  = Join-Path $VenvDir "Scripts\python.exe"
 
-$ReleaseTag = "prism-b8796-e2d6742"
-$WinAssetTag = "prism-b1-e2d6742"                    # Windows builds use shortened tag
+$ReleaseTag = "prism-b9596-9fcaed7"
+$WinAssetTag = "prism-b1-9fcaed7"                    # Windows builds use shortened tag
 $BaseUrl = "https://github.com/PrismML-Eng/llama.cpp/releases/download/$ReleaseTag"
 
-$BonsaiModel = if ($env:BONSAI_MODEL) { $env:BONSAI_MODEL } else { "8B" }
-$HfGgufRepo = "prism-ml/Bonsai-${BonsaiModel}-gguf"
+$BonsaiModel  = if ($env:BONSAI_MODEL)  { $env:BONSAI_MODEL }  else { "27B" }
+$BonsaiFamily = if ($env:BONSAI_FAMILY) { $env:BONSAI_FAMILY } else { "ternary" }
+
+$BonsaiModel = if ($BonsaiModel.ToLowerInvariant() -eq "all") { "all" } else { $BonsaiModel.ToUpperInvariant() }
+$BonsaiFamily = $BonsaiFamily.ToLowerInvariant()
+
+if ($BonsaiModel -notin @("27B", "8B", "4B", "1.7B", "all")) {
+    Write-Host "[ERR] Unknown BONSAI_MODEL='$BonsaiModel'. Valid values: 27B, 8B, 4B, 1.7B, all" -ForegroundColor Red
+    exit 1
+}
+if ($BonsaiFamily -notin @("bonsai", "ternary", "all")) {
+    Write-Host "[ERR] Unknown BONSAI_FAMILY='$BonsaiFamily'. Valid values: bonsai, ternary, all" -ForegroundColor Red
+    exit 1
+}
 
 # ── Helpers ──
 
@@ -63,15 +75,16 @@ function Find-CompatiblePython {
 Write-Host ""
 Write-Host "========================================="
 Write-Host "   Bonsai Demo Setup (Windows)"
-Write-Host "   Model: $BonsaiModel"
+Write-Host "   Family: $BonsaiFamily"
+Write-Host "   Model:  $BonsaiModel"
 Write-Host "========================================="
 Write-Host ""
 
 # ── 1. Check winget ──
-if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Host "[ERR] winget is not available." -ForegroundColor Red
-    Write-Host "      Install from https://aka.ms/getwinget or install Python $PythonVersion and uv manually." -ForegroundColor Yellow
-    exit 1
+$WingetCmd = Get-Command winget -ErrorAction SilentlyContinue
+if (-not $WingetCmd) {
+    Write-Host "[WARN] winget is not available." -ForegroundColor Yellow
+    Write-Host "      Continuing with existing toolchain; installs may require manual fallback." -ForegroundColor Yellow
 }
 
 # ── 2. Python ──
@@ -81,15 +94,21 @@ if ($DetectedPython) {
     Write-Host "[OK] Python $($DetectedPython.Version) found." -ForegroundColor Green
 } else {
     Write-Host "==> Installing Python $PythonVersion ..." -ForegroundColor Cyan
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try { winget install -e --id "Python.Python.$PythonVersion" --accept-package-agreements --accept-source-agreements } catch {}
-    $ErrorActionPreference = $prevEAP
-    Refresh-SessionPath
+    if ($WingetCmd) {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try { winget install -e --id "Python.Python.$PythonVersion" --accept-package-agreements --accept-source-agreements } catch {}
+        $ErrorActionPreference = $prevEAP
+        Refresh-SessionPath
+    }
     $DetectedPython = Find-CompatiblePython
     if (-not $DetectedPython) {
         Write-Host "[ERR] Python installation failed." -ForegroundColor Red
-        Write-Host "      Install Python $PythonVersion from https://www.python.org/downloads/" -ForegroundColor Yellow
+        if (-not $WingetCmd) {
+            Write-Host "      Manual installation required: winget is unavailable. Install Python $PythonVersion from https://www.python.org/downloads/" -ForegroundColor Yellow
+        } else {
+            Write-Host "      Install Python $PythonVersion from https://www.python.org/downloads/" -ForegroundColor Yellow
+        }
         exit 1
     }
 }
@@ -98,11 +117,13 @@ if ($DetectedPython) {
 Write-Host "==> Checking uv ..." -ForegroundColor Cyan
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     Write-Host "==> Installing uv ..." -ForegroundColor Cyan
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try { winget install --id=astral-sh.uv -e --accept-package-agreements --accept-source-agreements } catch {}
-    $ErrorActionPreference = $prevEAP
-    Refresh-SessionPath
+    if ($WingetCmd) {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try { winget install --id=astral-sh.uv -e --accept-package-agreements --accept-source-agreements } catch {}
+        $ErrorActionPreference = $prevEAP
+        Refresh-SessionPath
+    }
     if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
         Write-Host "    Trying alternative installer ..." -ForegroundColor Yellow
         powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
@@ -151,7 +172,7 @@ foreach ($p in @(
                     $CudaTag = "12.4"
                     $GpuType = "cuda"
                 } else {
-                    Write-Host "[WARN] Detected CUDA $major.$minor — older than 12.4, falling back to CPU." -ForegroundColor Yellow
+                    Write-Host "[WARN] Detected CUDA $major.$minor - older than 12.4, falling back to CPU." -ForegroundColor Yellow
                     $GpuType = "cpu"
                 }
                 break
@@ -194,35 +215,115 @@ if ($GpuType -eq "cuda") {
 }
 
 # ── 7. Download GGUF model ──
-Write-Host "==> Downloading model ($BonsaiModel) ..." -ForegroundColor Cyan
+Write-Host "==> Downloading model (family=$BonsaiFamily size=$BonsaiModel) ..." -ForegroundColor Cyan
 
-function Download-GgufModel($Size) {
-    $repo = "prism-ml/Bonsai-${Size}-gguf"
-    $dir = Join-Path $PSScriptRoot "models\gguf\$Size"
-    if (Test-Path "$dir\*.gguf") {
-        Write-Host "[OK] GGUF $Size already present." -ForegroundColor Green
+# Ensure Python-based HF CLI output is UTF-8-safe on hosted Windows runners.
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
+function Download-GgufModel($Family, $Size) {
+    # Each GGUF repo ships multiple quants (e.g. F16 + Q2_0); only fetch the
+    # quant the demo is built around so the directory deterministically holds
+    # one .gguf and we skip multi-GB reference weights we don't need.
+    if ($Family -eq "ternary") {
+        $repo = "prism-ml/Ternary-Bonsai-${Size}-gguf"
+        $dir = Join-Path $PSScriptRoot "models\ternary-gguf\$Size"
+        $display = "Ternary-Bonsai-$Size"
+        $pattern = "*-Q2_0.gguf"
+    } else {
+        $repo = "prism-ml/Bonsai-${Size}-gguf"
+        $dir = Join-Path $PSScriptRoot "models\gguf\$Size"
+        $display = "Bonsai-$Size"
+        $pattern = "*-Q1_0.gguf"
+    }
+
+    # 27B extras: the mmproj (multimodal projector) for image input, and the
+    # paired dspark drafter for optional speculative decoding (BONSAI_SPECULATIVE=1).
+    $mmprojPattern = if ($Size -eq "27B") { "*mmproj*.gguf" } else { $null }
+    $drafterPattern = if ($Size -eq "27B") { "*dspark-Q4_1*.gguf" } else { $null }
+
+    # Fast-path and post-download checks both filter on the target quant
+    # pattern (not just any *.gguf) so a leftover F16 or other quant from an
+    # earlier download doesn't get picked up at runtime. For 27B the fast-path
+    # also requires the mmproj + drafter so a re-run backfills vision + speculative.
+    $quantPresent = Get-ChildItem -Path $dir -Filter $pattern -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $mmprojPresent = if ($mmprojPattern) { Get-ChildItem -Path $dir -Filter $mmprojPattern -File -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $true }
+    $drafterPresent = if ($drafterPattern) { Get-ChildItem -Path $dir -Filter $drafterPattern -File -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $true }
+    if ($quantPresent -and $mmprojPresent -and $drafterPresent) {
+        Write-Host "[OK] GGUF $display ($pattern) already present." -ForegroundColor Green
         return
     }
-    $HfCli = Join-Path $VenvDir "Scripts\huggingface-cli.exe"
+
+    # HuggingFace auth: use BONSAI_TOKEN (env or .bonsai_token file) only if a
+    # repo is still private. Never a hard requirement; public repos download
+    # anonymously and hf surfaces a clear 401 if auth is genuinely needed.
+    if ($Size -eq "27B") {
+        $TokenFile = Join-Path $PSScriptRoot ".bonsai_token"
+        if (-not $env:BONSAI_TOKEN -and (Test-Path $TokenFile)) {
+            $env:BONSAI_TOKEN = (Get-Content -Raw $TokenFile).Trim()
+        }
+        if (-not $env:BONSAI_TOKEN) {
+            # Prompt only when a console can answer: Read-Host throws under
+            # -NonInteractive and can hang other headless hosts.
+            if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+                try {
+                    $entered = Read-Host "  Optional HuggingFace token for any still-private repo (press Enter to skip)"
+                    if ($entered) { $env:BONSAI_TOKEN = $entered }
+                } catch {}
+            } else {
+                Write-Host "[WARN] No interactive console for the optional token prompt; continuing without BONSAI_TOKEN." -ForegroundColor Yellow
+            }
+        }
+        if ($env:BONSAI_TOKEN) {
+            if (-not (Test-Path $TokenFile) -or ((Get-Content -Raw $TokenFile).Trim() -ne $env:BONSAI_TOKEN)) {
+                Set-Content -Path $TokenFile -Value $env:BONSAI_TOKEN -NoNewline
+            }
+            # Enforce current-user-only access every run, even for a
+            # pre-existing file with inherited broad permissions.
+            icacls $TokenFile /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+        }
+    }
+
+    $HfCli = Join-Path $VenvDir "Scripts\hf.exe"
     if (-not (Test-Path $HfCli)) {
-        $HfCli = Join-Path $VenvDir "Scripts\hf.exe"
+        $HfCli = Join-Path $VenvDir "Scripts\huggingface-cli.exe"
+    }
+    if (-not (Test-Path $HfCli)) {
+        Write-Host "[ERR] Hugging Face CLI not found in .venv (expected hf.exe or huggingface-cli.exe)." -ForegroundColor Red
+        exit 1
     }
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    & $HfCli download $repo --local-dir $dir
-    Write-Host "[OK] GGUF $Size downloaded." -ForegroundColor Green
+    $HfArgs = @("download", $repo, "--local-dir", $dir, "--include", $pattern)
+    if ($mmprojPattern) { $HfArgs += @("--include", $mmprojPattern) }
+    if ($drafterPattern) { $HfArgs += @("--include", $drafterPattern) }
+    if ($env:BONSAI_TOKEN) { $env:HF_TOKEN = $env:BONSAI_TOKEN }  # pass via env (hf reads HF_TOKEN), not a CLI arg visible in the process list
+    & $HfCli @HfArgs
+    $DownloadExitCode = $LASTEXITCODE
+    $DownloadedGguf = Get-ChildItem -Path $dir -Filter $pattern -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($DownloadExitCode -ne 0 -or -not $DownloadedGguf) {
+        Write-Host "[ERR] Failed to download GGUF $display matching $pattern. Try running '$HfCli download $repo --local-dir $dir --include $pattern' manually." -ForegroundColor Red
+        exit 1
+    }
+    if ($mmprojPattern -and -not (Get-ChildItem -Path $dir -Filter $mmprojPattern -File -ErrorAction SilentlyContinue)) {
+        Write-Host "[WARN] No $mmprojPattern file in $repo - image input will be disabled for $display." -ForegroundColor Yellow
+    }
+    Write-Host "[OK] GGUF $display downloaded." -ForegroundColor Green
 }
 
-if ($BonsaiModel -eq "all") {
-    foreach ($sz in @("8B", "4B", "1.7B")) { Download-GgufModel $sz }
-} else {
-    Download-GgufModel $BonsaiModel
+# Expand "all" for family and size into concrete lists, then iterate.
+$families = if ($BonsaiFamily -eq "all") { @("bonsai", "ternary") } else { @($BonsaiFamily) }
+$sizes    = if ($BonsaiModel  -eq "all") { @("27B", "8B", "4B", "1.7B") } else { @($BonsaiModel) }
+foreach ($fam in $families) {
+    foreach ($sz in $sizes) {
+        Download-GgufModel $fam $sz
+    }
 }
 
 # ── 8. Download pre-built binaries ──
 Write-Host "==> Downloading llama.cpp binaries ..." -ForegroundColor Cyan
 
-function Download-Binary($Asset, $BinDir) {
-    if (Test-Path "$BinDir\llama-cli.exe") {
+function Download-Binary($Asset, $BinDir, $RequiredFile = "llama-cli.exe") {
+    if (Test-Path (Join-Path $BinDir $RequiredFile)) {
         Write-Host "[OK] Binaries already present in $BinDir." -ForegroundColor Green
         return
     }
@@ -242,10 +343,28 @@ function Download-Binary($Asset, $BinDir) {
 # Detect Windows architecture
 $WinArch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) { "arm64" } else { "x64" }
 
-# GPU backends only have x64 builds — fall back to CPU on ARM64
+# GPU backends only have x64 builds - fall back to CPU on ARM64
 if ($WinArch -eq "arm64" -and $GpuType -ne "cpu") {
-    Write-Host "[WARN] $GpuType detected but no ARM64 build available — falling back to CPU." -ForegroundColor Yellow
+    Write-Host "[WARN] $GpuType detected but no ARM64 build available - falling back to CPU." -ForegroundColor Yellow
     $GpuType = "cpu"
+}
+
+# Refresh binaries when the pinned release changed (mirror of download_binaries.sh).
+# Remove any bin dir whose recorded release tag differs so it re-downloads below.
+foreach ($binRelDir in @("bin\hip", "bin\cuda", "bin\vulkan", "bin\cpu")) {
+    $binDir = Join-Path $PSScriptRoot $binRelDir
+    if (-not (Test-Path $binDir)) {
+        continue
+    }
+
+    $stampFile = Join-Path $binDir ".llama_release"
+    $installedTag = if (Test-Path $stampFile) { (Get-Content -Raw $stampFile).Trim() } else { "" }
+
+    if ($installedTag -ne $ReleaseTag) {
+        $was = if ($installedTag) { $installedTag } else { "an older/unknown release" }
+        Write-Host "[WARN] Binaries in $binRelDir are $was; updating to $ReleaseTag ..." -ForegroundColor Yellow
+        Remove-Item -Recurse -Force $binDir
+    }
 }
 
 if ($GpuType -eq "hip") {
@@ -270,17 +389,22 @@ if ($GpuType -eq "hip") {
     }
 } elseif ($GpuType -eq "vulkan") {
     $BinDir = Join-Path $PSScriptRoot "bin\vulkan"
-    Download-Binary "llama-bin-win-vulkan-x64.zip" $BinDir
+    Download-Binary "llama-bin-win-cpu-${WinArch}.zip" $BinDir "llama-cli.exe"
+    Download-Binary "llama-bin-win-vulkan-x64.zip" $BinDir "ggml-vulkan.dll"
 } else {
     # CPU fallback (arch-aware)
     $BinDir = Join-Path $PSScriptRoot "bin\cpu"
     Download-Binary "llama-bin-win-cpu-${WinArch}.zip" $BinDir
 }
 
+# Record the installed release so a future setup detects a version bump and
+# refreshes the binaries instead of keeping the old ones.
+if ($BinDir) { Set-Content -Path (Join-Path $BinDir ".llama_release") -Value $ReleaseTag -NoNewline -Encoding utf8 }
+
 # ── Done ──
 Write-Host ""
 Write-Host "========================================="
-Write-Host "   Setup complete! (BONSAI_MODEL=$BonsaiModel)"
+Write-Host "   Setup complete! (BONSAI_FAMILY=$BonsaiFamily BONSAI_MODEL=$BonsaiModel)"
 Write-Host "========================================="
 Write-Host ""
 Write-Host "  See README.md for usage examples." -ForegroundColor Cyan

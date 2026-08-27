@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEMO_DIR="$(resolve_demo_dir)"
 cd "$DEMO_DIR"
 
-RELEASE_TAG="prism-b8796-e2d6742"
+RELEASE_TAG="prism-b9596-9fcaed7"
 BASE_URL="https://github.com/PrismML-Eng/llama.cpp/releases/download/$RELEASE_TAG"
 
 OS="$(uname -s)"
@@ -42,7 +42,7 @@ case "$OS" in
         if command -v nvcc >/dev/null 2>&1; then
             _cuda_ver=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
         elif command -v nvidia-smi >/dev/null 2>&1; then
-            _cuda_ver=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version:[[:space:]]*\([0-9]*\.[0-9]*\).*/\1/p')
+            _cuda_ver=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA[ A-Z]*Version:[[:space:]]*\([0-9]*\.[0-9]*\).*/\1/p')
         fi
 
         if [ -n "$_cuda_ver" ]; then
@@ -101,8 +101,14 @@ esac
 URL="$BASE_URL/$ASSET"
 
 if [ -d "$DEST" ] && ls "$DEST"/llama-* >/dev/null 2>&1; then
-    info "Binaries already present in $DEST/"
-    exit 0
+    _installed=""
+    [ -f "$DEST/.llama_release" ] && _installed="$(cat "$DEST/.llama_release" 2>/dev/null)"
+    if [ "$_installed" = "$RELEASE_TAG" ]; then
+        info "Binaries already present in $DEST/ ($RELEASE_TAG)."
+        exit 0
+    fi
+    warn "Binaries in $DEST/ are ${_installed:-an older/unknown release}; updating to $RELEASE_TAG ..."
+    rm -rf "$DEST"
 fi
 
 step "Downloading $ASSET ..."
@@ -173,5 +179,9 @@ if [ "$OS" = "Darwin" ]; then
     fi
 fi
 
-info "Binaries installed to $DEST/"
+# Record the installed release so re-running setup can detect a version bump
+# and refresh the binaries instead of keeping the old ones.
+printf '%s\n' "$RELEASE_TAG" > "$DEST/.llama_release"
+
+info "Binaries installed to $DEST/ ($RELEASE_TAG)"
 ls -lh "$DEST"/llama-* 2>/dev/null || true

@@ -8,13 +8,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 assert_valid_model
 DEMO_DIR="$(resolve_demo_dir)"
 cd "$DEMO_DIR"
-assert_gguf_downloaded
+assert_gguf_downloaded run_mlx.sh
 
-# ── Find model ──
+# ── Find model: select exactly the demo quant for the family ──
 MODEL=""
-for _m in $GGUF_MODEL_DIR/*.gguf; do
-    [ -f "$_m" ] && MODEL="$_m" && break
+for _m in $GGUF_MODEL_DIR/$GGUF_QUANT_PATTERN; do
+    [ -f "$_m" ] || continue
+    case "$_m" in *mmproj*|*dspark*|*kv-bias*) continue ;; esac
+    MODEL="$_m" && break
 done
+if [ -z "$MODEL" ]; then
+    err "No ${GGUF_QUANT_PATTERN} model found in ${GGUF_MODEL_DIR}/."
+    echo "  Re-run ./scripts/download_models.sh to fetch the model weights."
+    exit 1
+fi
 
 # ── Find binary (search all known locations) ──
 BIN=""
@@ -34,19 +41,18 @@ NGL=$(bonsai_llama_ngl)
 
 info "Model:  $MODEL"
 info "Binary: $BIN"
-info "Using -ngl $NGL, -c 0 (auto-fit to available memory)"
+info "Using -ngl $NGL (override with BONSAI_NGL, 0 = CPU-only), -c $CTX_SIZE_DEFAULT (override with BONSAI_CTX, 0 = auto)"
 
-"$BIN" -m "$MODEL" -ngl "$NGL" -c "$CTX_SIZE_DEFAULT" --log-disable \
+# 27B: reference-demo sampling, thinking stays enabled (model default).
+# Older sizes keep the exact flag set they were tested with.
+if [ "$BONSAI_MODEL" = "27B" ]; then
+    exec "$BIN" -m "$MODEL" -ngl "$NGL" -fa on -c "$CTX_SIZE_DEFAULT" --log-disable \
+        --temp 0.7 --top-p 0.95 --top-k 20 --min-p 0 \
+        "$@"
+fi
+
+exec "$BIN" -m "$MODEL" -ngl "$NGL" -fa on -c "$CTX_SIZE_DEFAULT" --log-disable \
     --temp 0.5 --top-p 0.85 --top-k 20 --min-p 0 \
     --reasoning-budget 0 --reasoning-format none \
     --chat-template-kwargs '{"enable_thinking": false}' \
-    "$@" 2>/dev/null \
-|| {
-    CTX_SIZE=$(get_context_size_fallback)
-    warn "Auto-fit not supported, falling back to -c $CTX_SIZE"
-    "$BIN" -m "$MODEL" -ngl "$NGL" -c "$CTX_SIZE" --log-disable \
-        --temp 0.5 --top-p 0.85 --top-k 20 --min-p 0 \
-        --reasoning-budget 0 --reasoning-format none \
-        --chat-template-kwargs '{"enable_thinking": false}' \
-        "$@" 2>/dev/null
-}
+    "$@"
